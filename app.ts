@@ -6,8 +6,9 @@
 // store's logical clock. Nothing here reads the wall clock or Math.random.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { forge, VIEWER, type IssueRec, type PullRec, type RepoRec } from './store.ts';
+import { forge, performMerge, VIEWER, type IssueRec, type PullRec, type RepoRec } from './store.ts';
 import { handleInfoRefs, handleReceivePack, handleUploadPack } from './git.ts';
+import { handleGraphQL } from './graphql.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -528,31 +529,6 @@ function handleIssueComments(ctx: Ctx, owner: string, name: string, n: number): 
   );
 }
 
-/** Three-way file merge of head onto base from their merge base; null on conflict. */
-function mergeTrees(repo: RepoRec, baseTip: string, headTip: string): Map<string, { sha: string; mode: string }> | null {
-  const mb = forge.store.mergeBase(baseTip, headTip);
-  const baseFiles = forge.store.filesAt(baseTip);
-  const headFiles = forge.store.filesAt(headTip);
-  const mbFiles = mb ? forge.store.filesAt(mb) : new Map<string, { sha: string; mode: string }>();
-  const out = new Map(baseFiles);
-  const paths = new Set([...mbFiles.keys(), ...baseFiles.keys(), ...headFiles.keys()]);
-  for (const path of paths) {
-    const inMb = mbFiles.get(path)?.sha;
-    const inBase = baseFiles.get(path)?.sha;
-    const inHead = headFiles.get(path)?.sha;
-    if (inBase === inHead) continue;
-    if (inMb === inBase) {
-      if (inHead === undefined) out.delete(path);
-      else out.set(path, headFiles.get(path) as { sha: string; mode: string });
-    } else if (inMb === inHead) {
-      // only base changed it: keep base
-    } else {
-      return null;
-    }
-  }
-  return out;
-}
-
 function handlePulls(ctx: Ctx, owner: string, name: string): void {
   const repo = requireRepo(owner, name);
   if (ctx.req.method === 'POST') {
@@ -636,28 +612,9 @@ function handlePullMerge(ctx: Ctx, owner: string, name: string, n: number): void
   const pull = findPull(repo, n);
   if (pull.merged || pull.state !== 'open') throw new HttpError(405, 'Pull Request is not mergeable');
   const method = str(ctx.body, 'merge_method') ?? 'merge';
-  const baseTip = branchTip(repo, pull.baseRef);
-  const headTip = branchTip(repo, pull.headRef);
-  if (!baseTip || !headTip) throw new HttpError(405, 'Pull Request is not mergeable');
-  const merged = mergeTrees(repo, baseTip, headTip);
-  if (!merged) throw new HttpError(405, 'Pull Request is not mergeable: merge conflict');
-  const tree = forge.store.writeTreeFromFiles(merged);
-  const ts = forge.clock.tick();
-  let commit: string;
-  if (method === 'squash') {
-    const message = `${pull.title} (#${pull.number})\n\n${pull.body}`;
-    commit = forge.store.writeCommit({ tree, parents: [baseTip], message, ts });
-  } else {
-    const message = `Merge pull request #${pull.number} from ${pull.headRef}\n\n${pull.title}`;
-    commit = forge.store.writeCommit({ tree, parents: [baseTip, headTip], message, ts });
-  }
-  repo.refs.set(`refs/heads/${pull.baseRef}`, commit);
-  pull.state = 'closed';
-  pull.merged = true;
-  pull.mergedAt = ts;
-  pull.mergeCommitSha = commit;
-  pull.updatedAt = ts;
-  sendJson(ctx.res, 200, { sha: commit, merged: true, message: 'Pull Request successfully merged' });
+  const result = performMerge(forge, repo, pull, method);
+  if (!result.ok) throw new HttpError(405, 'Pull Request is not mergeable: merge conflict');
+  sendJson(ctx.res, 200, { sha: result.sha, merged: true, message: 'Pull Request successfully merged' });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -681,7 +638,12 @@ async function route(ctx: Ctx): Promise<void> {
     if (auth !== `Bearer ${TOKEN}`) throw new HttpError(401, 'Bad credentials');
   }
 
-  if (isGraphql || isMcp) {
+  if (isGraphql) {
+    const reply = handleGraphQL(ctx.rawBody);
+    sendJson(res, reply.status, reply.body);
+    return;
+  }
+  if (isMcp) {
     notFound();
   }
 
@@ -767,7 +729,8 @@ export function createApp(): Server {
         const url = new URL(req.url ?? '/', 'http://entry');
         const rawBody = await readBody(req);
         const contentType = req.headers['content-type'] ?? '';
-        const needsJson = rawBody.length > 0 && contentType.includes('application/json') && (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH' || req.method === 'DELETE');
+        const rawSurface = url.pathname === '/api/graphql' || url.pathname === '/mcp';
+        const needsJson = !rawSurface && rawBody.length > 0 && contentType.includes('application/json') && (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH' || req.method === 'DELETE');
         const body = needsJson ? parseJsonBody(rawBody) : {};
         await route({ req, res, url, body, rawBody });
       } catch (err) {

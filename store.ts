@@ -402,3 +402,69 @@ export class Forge {
 
 /** The one forge instance the whole process serves. */
 export const forge = new Forge();
+
+/**
+ * Three-way file merge of a head commit onto a base commit from their merge base.
+ * Returns the merged file map, or null when both sides changed the same file differently.
+ */
+export function mergeFileMaps(
+  store: ObjectStore,
+  baseTip: string,
+  headTip: string,
+): Map<string, { sha: string; mode: string }> | null {
+  const mb = store.mergeBase(baseTip, headTip);
+  const baseFiles = store.filesAt(baseTip);
+  const headFiles = store.filesAt(headTip);
+  const mbFiles = mb ? store.filesAt(mb) : new Map<string, { sha: string; mode: string }>();
+  const out = new Map(baseFiles);
+  const paths = new Set([...mbFiles.keys(), ...baseFiles.keys(), ...headFiles.keys()]);
+  for (const path of paths) {
+    const inMb = mbFiles.get(path)?.sha;
+    const inBase = baseFiles.get(path)?.sha;
+    const inHead = headFiles.get(path)?.sha;
+    if (inBase === inHead) continue;
+    if (inMb === inBase) {
+      if (inHead === undefined) out.delete(path);
+      else out.set(path, headFiles.get(path) as { sha: string; mode: string });
+    } else if (inMb === inHead) {
+      // only the base side changed it: keep base
+    } else {
+      return null;
+    }
+  }
+  return out;
+}
+
+/**
+ * Merge a pull request into its base branch (squash or merge commit). On success the pull
+ * record is updated and the merge commit sha returned; on conflict nothing changes.
+ */
+export function performMerge(
+  forgeRef: Forge,
+  repo: RepoRec,
+  pull: PullRec,
+  method: string,
+): { ok: true; sha: string } | { ok: false; reason: string } {
+  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
+  const headTip = repo.refs.get(`refs/heads/${pull.headRef}`);
+  if (!baseTip || !headTip) return { ok: false, reason: 'branch tip missing' };
+  const merged = mergeFileMaps(forgeRef.store, baseTip, headTip);
+  if (!merged) return { ok: false, reason: 'merge conflict' };
+  const tree = forgeRef.store.writeTreeFromFiles(merged);
+  const ts = forgeRef.clock.tick();
+  let commit: string;
+  if (method === 'squash') {
+    const message = `${pull.title} (#${pull.number})\n\n${pull.body}`;
+    commit = forgeRef.store.writeCommit({ tree, parents: [baseTip], message, ts });
+  } else {
+    const message = `Merge pull request #${pull.number} from ${pull.headRef}\n\n${pull.title}`;
+    commit = forgeRef.store.writeCommit({ tree, parents: [baseTip, headTip], message, ts });
+  }
+  repo.refs.set(`refs/heads/${pull.baseRef}`, commit);
+  pull.state = 'closed';
+  pull.merged = true;
+  pull.mergedAt = ts;
+  pull.mergeCommitSha = commit;
+  pull.updatedAt = ts;
+  return { ok: true, sha: commit };
+}
