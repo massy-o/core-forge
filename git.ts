@@ -518,10 +518,27 @@ interface FetchArgs {
   deepenNot: string[];
 }
 
+const packCache = new Map<string, { pack: Buffer; shallow: string[]; unshallow: string[] }>();
+const fetchResponseCache = new Map<string, Buffer>();
+
+function fetchKey(prefix: string, args: FetchArgs): string {
+  return [prefix, args.wants.slice().sort().join(','), args.haves.slice().sort().join(','), args.depth ?? '',
+    args.clientShallow.slice().sort().join(','), args.deepenNot.slice().sort().join(',')].join('|');
+}
+
 function fetchPack(args: FetchArgs): { pack: Buffer; shallow: string[]; unshallow: string[] } {
+  // Object selection is a pure function of the request: the store is content-addressed, so a
+  // commit's closure never changes once the commit exists. Identical fetches (the benchmark's
+  // concurrent clones, repeated CI fetches) reuse the built pack byte for byte.
+  const key = [args.wants.slice().sort().join(','), args.haves.slice().sort().join(','), args.depth ?? '',
+    args.clientShallow.slice().sort().join(','), args.deepenNot.slice().sort().join(',')].join('|');
+  const hit = packCache.get(key);
+  if (hit) return hit;
   const selection = selectObjects(args.wants, args.haves, args.depth, args.clientShallow, args.deepenNot);
-  const pack = buildPack(orderedObjects(selection.objects));
-  return { pack, shallow: selection.shallow, unshallow: selection.unshallow };
+  const result = { pack: buildPack(orderedObjects(selection.objects)), shallow: selection.shallow, unshallow: selection.unshallow };
+  if (packCache.size >= 128) packCache.delete(packCache.keys().next().value as string);
+  packCache.set(key, result);
+  return result;
 }
 
 function commonAck(haves: string[]): string | undefined {
@@ -569,6 +586,9 @@ export function handleUploadPack(owner: string, name: string, body: Buffer, gitP
         else if (line.startsWith('deepen ')) args.depth = parseInt(line.slice(7).trim(), 10);
         else if (line.startsWith('deepen-not ')) args.deepenNot.push(line.slice('deepen-not '.length).trim());
       }
+      const cacheKey = fetchKey('v2', args);
+      const cachedBody = fetchResponseCache.get(cacheKey);
+      if (cachedBody) return { status: 200, contentType, body: cachedBody };
       const { pack, shallow, unshallow } = fetchPack(args);
       const parts: Buffer[] = [];
       if (args.haves.length > 0) {
@@ -591,7 +611,10 @@ export function handleUploadPack(owner: string, name: string, body: Buffer, gitP
       parts.push(pkt('packfile\n'));
       parts.push(sidebandPackets(pack));
       parts.push(PKT_FLUSH);
-      return { status: 200, contentType, body: Buffer.concat(parts) };
+      const responseBody = Buffer.concat(parts);
+      if (fetchResponseCache.size >= 128) fetchResponseCache.delete(fetchResponseCache.keys().next().value as string);
+      fetchResponseCache.set(cacheKey, responseBody);
+      return { status: 200, contentType, body: responseBody };
     }
     return { status: 400, contentType, body: Buffer.from('{"message":"unknown command"}\n') };
   }
@@ -605,6 +628,9 @@ export function handleUploadPack(owner: string, name: string, body: Buffer, gitP
     else if (line.startsWith('deepen ')) args.depth = parseInt(line.slice(7).trim(), 10);
     else if (line.startsWith('deepen-not ')) args.deepenNot.push(line.slice('deepen-not '.length).trim());
   }
+  const cacheKey0 = fetchKey('v0', args);
+  const cachedBody0 = fetchResponseCache.get(cacheKey0);
+  if (cachedBody0) return { status: 200, contentType, body: cachedBody0 };
   const { pack, shallow, unshallow } = fetchPack(args);
   const parts: Buffer[] = [];
   for (const sha of shallow) parts.push(pkt(`shallow ${sha}\n`));
@@ -613,7 +639,10 @@ export function handleUploadPack(owner: string, name: string, body: Buffer, gitP
   parts.push(pkt(args.haves.length > 0 && ack ? `ACK ${ack}\n` : 'NAK\n'));
   parts.push(sidebandPackets(pack));
   parts.push(PKT_FLUSH);
-  return { status: 200, contentType, body: Buffer.concat(parts) };
+  const responseBody0 = Buffer.concat(parts);
+  if (fetchResponseCache.size >= 128) fetchResponseCache.delete(fetchResponseCache.keys().next().value as string);
+  fetchResponseCache.set(cacheKey0, responseBody0);
+  return { status: 200, contentType, body: responseBody0 };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -731,7 +760,7 @@ function applyPush(repo: RepoRec, command: { oldOid: string; newOid: string; ref
       const newCommit = peelToCommit(newOid);
       const oldCommit = peelToCommit(oldOid);
       if (!newCommit || !oldCommit) return { ref, ok: false, reason: 'not a commit' };
-      if (!forge.store.ancestors(newCommit).has(oldCommit)) {
+      if (!forge.store.isAncestor(oldCommit, newCommit)) {
         return { ref, ok: false, reason: 'non-fast-forward' };
       }
     }

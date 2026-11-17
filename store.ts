@@ -215,6 +215,23 @@ export class ObjectStore {
     return this.flattenTree(info.tree);
   }
 
+  /** True when `anc` is `desc` itself or one of its ancestors; stops as soon as it is found. */
+  isAncestor(anc: string, desc: string): boolean {
+    if (anc === desc) return true;
+    const seen = new Set<string>();
+    const stack = [desc];
+    while (stack.length > 0) {
+      const cur = stack.pop() as string;
+      if (cur === anc) return true;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      const obj = this.read(cur);
+      if (!obj || obj.type !== 'commit') continue;
+      for (const parent of this.parseCommit(obj.data).parents) stack.push(parent);
+    }
+    return false;
+  }
+
   /** All ancestors of a commit (including itself), via BFS over parents. */
   ancestors(sha: string): Set<string> {
     const seen = new Set<string>();

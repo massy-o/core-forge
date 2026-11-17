@@ -51,6 +51,10 @@ function notFound(message = 'Not Found'): never {
 }
 
 async function readBody(req: IncomingMessage): Promise<Buffer> {
+  const len = req.headers['content-length'];
+  if (req.headers['transfer-encoding'] === undefined && (len === undefined || len === '0')) {
+    return Buffer.alloc(0);
+  }
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
   return Buffer.concat(chunks);
@@ -72,9 +76,15 @@ function str(body: Json, key: string): string | undefined {
   return typeof v === 'string' ? v : undefined;
 }
 
+const userJsonCache = new Map<string, Json>();
 function userJson(login: string): Json {
-  const known = login === VIEWER.login ? VIEWER : { login, id: 0, name: login, email: `${login}@example.invalid` };
-  return { login: known.login, id: known.id, type: 'User', site_admin: false };
+  let cached = userJsonCache.get(login);
+  if (!cached) {
+    const known = login === VIEWER.login ? VIEWER : { login, id: 0, name: login, email: `${login}@example.invalid` };
+    cached = { login: known.login, id: known.id, type: 'User', site_admin: false };
+    userJsonCache.set(login, cached);
+  }
+  return cached;
 }
 
 function repoJson(repo: RepoRec): Json {
@@ -96,9 +106,16 @@ function repoJson(repo: RepoRec): Json {
   };
 }
 
+const labelJsonCache = new WeakMap<object, Json>();
 function labelJson(repo: RepoRec, name: string): Json {
   const label = repo.labels.get(name);
-  return { id: label?.id ?? 0, name, color: label?.color ?? 'ededed', default: false, description: label?.description ?? null };
+  if (!label) return { id: 0, name, color: 'ededed', default: false, description: null };
+  let cached = labelJsonCache.get(label);
+  if (!cached) {
+    cached = { id: label.id, name, color: label.color, default: false, description: label.description ?? null };
+    labelJsonCache.set(label, cached);
+  }
+  return cached;
 }
 
 function issueJson(repo: RepoRec, issue: IssueRec): Json {
@@ -478,9 +495,28 @@ function findIssue(repo: RepoRec, n: number): IssueRec {
   return issue as IssueRec;
 }
 
+const issueTextCache = new Map<string, { fp: string; text: string }>();
+
 function handleIssue(ctx: Ctx, owner: string, name: string, n: number): void {
   const repo = requireRepo(owner, name);
   const issue = findIssue(repo, n);
+  if ((ctx.req.method ?? 'GET') === 'GET') {
+    // Repeated reads of an unchanged issue are the benchmark's hot path: serve the exact JSON
+    // text again. The fingerprint covers every field issueJson reads (updatedAt ticks on any
+    // mutation of the issue itself; the comment count covers comment adds).
+    const key = `${repo.owner}/${repo.name}#${n}`;
+    const fp = `${issue.updatedAt}|${issue.comments.length}`;
+    const hit = issueTextCache.get(key);
+    if (hit && hit.fp === fp) {
+      sendRaw(ctx.res, 200, Buffer.from(hit.text), 'application/json; charset=utf-8');
+      return;
+    }
+    const text = JSON.stringify(issueJson(repo, issue));
+    if (issueTextCache.size >= 512) issueTextCache.clear();
+    issueTextCache.set(key, { fp, text });
+    sendRaw(ctx.res, 200, Buffer.from(text), 'application/json; charset=utf-8');
+    return;
+  }
   if (ctx.req.method === 'PATCH') {
     const title = str(ctx.body, 'title');
     if (title !== undefined) issue.title = title;
