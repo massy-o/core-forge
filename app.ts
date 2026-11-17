@@ -9,6 +9,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { forge, performMerge, VIEWER, type IssueRec, type PullRec, type RepoRec } from './store.ts';
 import { handleInfoRefs, handleReceivePack, handleUploadPack } from './git.ts';
 import { handleGraphQL } from './graphql.ts';
+import { handleMCP } from './mcp.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -644,7 +645,10 @@ async function route(ctx: Ctx): Promise<void> {
     return;
   }
   if (isMcp) {
-    notFound();
+    if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
+    const reply = handleMCP(ctx.rawBody);
+    sendJson(res, reply.status, reply.body);
+    return;
   }
 
   if (path === '/api/v3' || path === '/api/v3/') {
@@ -702,6 +706,23 @@ async function route(ctx: Ctx): Promise<void> {
       return;
     }
     if (rest[0] === 'branches' && rest.length === 1) return handleBranches(ctx, owner, name);
+    if (rest[0] === 'branches' && rest.length === 2) {
+      const repo = requireRepo(owner, name);
+      const branchName = decodeURIComponent(rest[1] as string);
+      const tip = branchTip(repo, branchName);
+      if (!tip) notFound();
+      sendJson(ctx.res, 200, { name: branchName, commit: { sha: tip }, protected: false });
+      return;
+    }
+    if (rest[0] === 'git' && rest[1] === 'refs' && rest.length >= 3 && (ctx.req.method ?? 'GET') === 'GET') {
+      const repo = requireRepo(owner, name);
+      const refName = rest.slice(2).map((s) => decodeURIComponent(s)).join('/');
+      const fullRef = refName.startsWith('refs/') ? refName : `refs/${refName}`;
+      const sha = repo.refs.get(fullRef);
+      if (!sha) notFound();
+      sendJson(ctx.res, 200, { ref: fullRef, object: { sha, type: 'commit' } });
+      return;
+    }
     if (rest[0] === 'commits' && rest.length === 1) return handleCommits(ctx, owner, name);
     if (rest[0] === 'git' && rest[1] === 'refs' && rest.length === 2) return handleGitRefs(ctx, owner, name);
     if (rest[0] === 'contents' && rest.length >= 1) {
