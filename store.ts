@@ -399,3 +399,6 @@ export class Forge {
     return commit;
   }
 }
+
+/** The one forge instance the whole process serves. */
+export const forge = new Forge();

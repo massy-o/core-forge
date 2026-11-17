@@ -6,12 +6,12 @@
 // store's logical clock. Nothing here reads the wall clock or Math.random.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { Forge, VIEWER, type IssueRec, type PullRec, type RepoRec } from './store.ts';
+import { forge, VIEWER, type IssueRec, type PullRec, type RepoRec } from './store.ts';
+import { handleInfoRefs, handleReceivePack, handleUploadPack } from './git.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
-export const forge = new Forge();
 
 type Json = Record<string, unknown>;
 
@@ -707,6 +707,30 @@ async function route(ctx: Ctx): Promise<void> {
   }
 
   const seg = path.split('/').filter((s) => s !== '');
+
+  // git smart HTTP: /{owner}/{repo}.git/{info/refs,git-upload-pack,git-receive-pack}
+  if (seg.length >= 3 && (seg[1] as string).endsWith('.git')) {
+    const owner = decodeURIComponent(seg[0] as string);
+    const repoName = decodeURIComponent((seg[1] as string).slice(0, -4));
+    const tail = seg.slice(2).join('/');
+    const gitProtocol = req.headers['git-protocol'] ?? null;
+    if (tail === 'info/refs' && method === 'GET') {
+      const reply = handleInfoRefs(owner, repoName, ctx.url.searchParams.get('service') ?? '', typeof gitProtocol === 'string' ? gitProtocol : null);
+      sendRaw(res, reply.status, reply.body, reply.contentType);
+      return;
+    }
+    if (tail === 'git-upload-pack' && method === 'POST') {
+      const reply = handleUploadPack(owner, repoName, ctx.rawBody, typeof gitProtocol === 'string' ? gitProtocol : null);
+      sendRaw(res, reply.status, reply.body, reply.contentType);
+      return;
+    }
+    if (tail === 'git-receive-pack' && method === 'POST') {
+      const reply = handleReceivePack(owner, repoName, ctx.rawBody);
+      sendRaw(res, reply.status, reply.body, reply.contentType);
+      return;
+    }
+  }
+
   if (seg[0] === 'api' && seg[1] === 'v3' && seg[2] === 'repos' && seg.length >= 5) {
     const owner = decodeURIComponent(seg[3] as string);
     const name = decodeURIComponent(seg[4] as string);
@@ -742,7 +766,8 @@ export function createApp(): Server {
       try {
         const url = new URL(req.url ?? '/', 'http://entry');
         const rawBody = await readBody(req);
-        const needsJson = rawBody.length > 0 && (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH' || req.method === 'DELETE');
+        const contentType = req.headers['content-type'] ?? '';
+        const needsJson = rawBody.length > 0 && contentType.includes('application/json') && (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH' || req.method === 'DELETE');
         const body = needsJson ? parseJsonBody(rawBody) : {};
         await route({ req, res, url, body, rawBody });
       } catch (err) {
