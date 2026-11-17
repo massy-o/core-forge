@@ -331,10 +331,23 @@ export interface RepoRec {
   createdAt: number;
   updatedAt: number;
   refs: Map<string, string>;
+  /** Bump on every ref mutation: read caches (ls-refs) key on it. */
+  refsVersion: number;
   labels: Map<string, LabelRec>;
   issues: IssueRec[];
   pulls: PullRec[];
   nextNumber: number;
+}
+
+/** Set a ref and bump the repo's ref version (the ls-refs cache keys on it). */
+export function setRef(repo: RepoRec, ref: string, sha: string): void {
+  repo.refs.set(ref, sha);
+  repo.refsVersion += 1;
+}
+
+/** Delete a ref and bump the repo's ref version when it existed. */
+export function deleteRef(repo: RepoRec, ref: string): void {
+  if (repo.refs.delete(ref)) repo.refsVersion += 1;
 }
 
 export class Forge {
@@ -372,6 +385,7 @@ export class Forge {
       createdAt: ts,
       updatedAt: ts,
       refs: new Map(),
+      refsVersion: 0,
       labels: new Map(),
       issues: [],
       pulls: [],
@@ -411,7 +425,7 @@ export class Forge {
     const tree = this.store.writeTreeFromFiles(files);
     const ts = this.clock.tick();
     const commit = this.store.writeCommit({ tree, parents: parent ? [parent] : [], message, ts });
-    repo.refs.set(refName, commit);
+    setRef(repo, refName, commit);
     repo.updatedAt = ts;
     return commit;
   }
@@ -477,7 +491,7 @@ export function performMerge(
     const message = `Merge pull request #${pull.number} from ${pull.headRef}\n\n${pull.title}`;
     commit = forgeRef.store.writeCommit({ tree, parents: [baseTip, headTip], message, ts });
   }
-  repo.refs.set(`refs/heads/${pull.baseRef}`, commit);
+  setRef(repo, `refs/heads/${pull.baseRef}`, commit);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = ts;

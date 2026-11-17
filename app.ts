@@ -6,7 +6,7 @@
 // store's logical clock. Nothing here reads the wall clock or Math.random.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { forge, performMerge, VIEWER, type IssueRec, type PullRec, type RepoRec } from './store.ts';
+import { forge, performMerge, setRef, VIEWER, type IssueRec, type PullRec, type RepoRec } from './store.ts';
 import { handleInfoRefs, handleReceivePack, handleUploadPack } from './git.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMCP } from './mcp.ts';
@@ -349,7 +349,7 @@ function handleGitRefs(ctx: Ctx, owner: string, name: string): void {
     const ref = str(ctx.body, 'ref');
     const sha = str(ctx.body, 'sha');
     if (!ref || !sha || !forge.store.has(sha)) throw new HttpError(422, 'ref and a known sha are required');
-    repo.refs.set(ref, sha);
+    setRef(repo, ref, sha);
     sendJson(ctx.res, 201, { ref, object: { sha, type: 'commit' } });
     return;
   }
@@ -783,7 +783,12 @@ export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
-        const url = new URL(req.url ?? '/', 'http://entry');
+        // Most requests carry no query string: skip the URL parser for them and hand
+        // route() a shim with the two members it reads (pathname, searchParams).
+        const rawUrl = req.url ?? '/';
+        const url: URL = rawUrl.indexOf('?') === -1
+          ? ({ pathname: rawUrl, searchParams: new URLSearchParams() } as unknown as URL)
+          : new URL(rawUrl, 'http://entry');
         const rawBody = await readBody(req);
         const contentType = req.headers['content-type'] ?? '';
         const rawSurface = url.pathname === '/api/graphql' || url.pathname === '/mcp';

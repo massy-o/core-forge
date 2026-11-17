@@ -6,7 +6,7 @@
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
-import { forge, VIEWER, type ObjType, type RepoRec } from './store.ts';
+import { deleteRef, forge, setRef, VIEWER, type ObjType, type RepoRec } from './store.ts';
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
 const AGENT = 'core-forge/1.0';
@@ -447,15 +447,8 @@ export function handleInfoRefs(owner: string, name: string, service: string, git
   }
   const contentType = `application/x-${service}-advertisement`;
   if (service === 'git-upload-pack' && gitProtocol === 'version=2') {
-    const parts = [
-      pkt('version 2\n'),
-      pkt(`agent=${AGENT}\n`),
-      pkt('ls-refs=unborn\n'),
-      pkt('fetch=shallow wait-for-done\n'),
-      pkt('object-format=sha1\n'),
-      PKT_FLUSH,
-    ];
-    return { status: 200, contentType, body: Buffer.concat(parts) };
+    // The v2 capability list names no repository state: build it once, serve it forever.
+    return { status: 200, contentType, body: ADV_V2_BODY };
   }
   const { firstCaps, refLines } = advertisementLines(repo, service);
   const parts: Buffer[] = [pkt(`# service=${service}\n`), PKT_FLUSH];
@@ -520,6 +513,17 @@ interface FetchArgs {
 
 const packCache = new Map<string, { pack: Buffer; shallow: string[]; unshallow: string[] }>();
 const fetchResponseCache = new Map<string, Buffer>();
+const lsRefsCache = new Map<string, Buffer>();
+
+/** The protocol-v2 capability advertisement: constant for the life of the process. */
+const ADV_V2_BODY = Buffer.concat([
+  pkt('version 2\n'),
+  pkt(`agent=${AGENT}\n`),
+  pkt('ls-refs=unborn\n'),
+  pkt('fetch=shallow wait-for-done\n'),
+  pkt('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
 
 function fetchKey(prefix: string, args: FetchArgs): string {
   return [prefix, args.wants.slice().sort().join(','), args.haves.slice().sort().join(','), args.depth ?? '',
@@ -575,7 +579,15 @@ export function handleUploadPack(owner: string, name: string, body: Buffer, gitP
       }
     }
     if (command === 'ls-refs') {
-      return { status: 200, contentType, body: handleLsRefs(repo, argLines) };
+      // An ls-refs answer is a pure function of the repo's refs and the request lines:
+      // cache it against the ref version, which every ref mutation bumps.
+      const key = `${repo.id}|${repo.refsVersion}|${argLines.join('\n')}`;
+      const hit = lsRefsCache.get(key);
+      if (hit) return { status: 200, contentType, body: hit };
+      const body = handleLsRefs(repo, argLines);
+      if (lsRefsCache.size >= 256) lsRefsCache.delete(lsRefsCache.keys().next().value as string);
+      lsRefsCache.set(key, body);
+      return { status: 200, contentType, body };
     }
     if (command === 'fetch') {
       const args: FetchArgs = { wants: [], haves: [], clientShallow: [], deepenNot: [] };
@@ -749,7 +761,7 @@ function applyPush(repo: RepoRec, command: { oldOid: string; newOid: string; ref
   if (newOid === ZERO_OID) {
     // delete
     if (ref === `refs/heads/${repo.defaultBranch}`) return { ref, ok: false, reason: 'deletion of the current branch prohibited' };
-    repo.refs.delete(ref);
+    deleteRef(repo, ref);
     return { ref, ok: true, reason: '' };
   }
   const target = forge.store.read(newOid);
@@ -765,7 +777,7 @@ function applyPush(repo: RepoRec, command: { oldOid: string; newOid: string; ref
       }
     }
   }
-  repo.refs.set(ref, newOid);
+  setRef(repo, ref, newOid);
   repo.updatedAt = forge.clock.tick();
   return { ref, ok: true, reason: '' };
 }
