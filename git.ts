@@ -276,7 +276,21 @@ function closureOf(start: string, into: Map<string, { type: ObjType; data: Buffe
  */
 function selectObjects(wants: string[], haves: string[], depth: number | undefined, clientShallow: string[], deepenNot: string[]): Selection {
   const exclude = new Map<string, { type: ObjType; data: Buffer }>();
-  for (const have of haves) closureOf(have, exclude);
+  for (const have of haves) {
+    if (clientShallow.includes(have)) {
+      // A shallow have proves the client holds the commit and its tree, not its history.
+      const info = forge.store.commitInfo(have);
+      if (info) {
+        const obj = forge.store.read(have);
+        if (obj) exclude.set(have, obj);
+        closureOf(info.tree, exclude);
+      } else {
+        closureOf(have, exclude);
+      }
+    } else {
+      closureOf(have, exclude);
+    }
+  }
   for (const not of deepenNot) closureOf(not, exclude);
 
   const objects = new Map<string, { type: ObjType; data: Buffer }>();
@@ -358,10 +372,10 @@ function orderedObjects(objects: Map<string, { type: ObjType; data: Buffer }>): 
   return [...objects.values()].sort((a, b) => rank[a.type] - rank[b.type]);
 }
 
-/** Wrap pack bytes in sideband-64k band-1 packets. */
+/** Wrap pack bytes in sideband-64k band-1 packets (payload + header must stay <= 65520). */
 function sidebandPackets(pack: Buffer): Buffer {
   const chunks: Buffer[] = [];
-  const MAX = 65519;
+  const MAX = 65515;
   for (let i = 0; i < pack.length; i += MAX) {
     chunks.push(pkt(Buffer.concat([Buffer.from([1]), pack.subarray(i, i + MAX)])));
   }
@@ -687,7 +701,7 @@ export function handleReceivePack(owner: string, name: string, body: Buffer): Gi
   const reportStream = Buffer.concat([...reportLines.map((l) => pkt(`${l}\n`)), PKT_FLUSH]);
   if (sideband) {
     const chunks: Buffer[] = [];
-    const MAX = 65519;
+    const MAX = 65515;
     for (let i = 0; i < reportStream.length; i += MAX) {
       chunks.push(pkt(Buffer.concat([Buffer.from([1]), reportStream.subarray(i, i + MAX)])));
     }
